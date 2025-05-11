@@ -418,7 +418,7 @@ class NPUModelRunner:
     def make_attention_mask(self, seq_lens, query_lens, position,
                             attn_state) -> torch.Tensor:
         # Chunk Prefill situation.
-        if attn_state == AscendAttentionState.ChunkedPrefill:
+        if attn_state == AscendAttentionState.ChunkedPrefill or attn_state == AscendAttentionState.PrefillCacheHitMiniBlock:
             return self.attn_mask_builder.get_splitfuse_attn_mask(
                 seq_lens, query_lens, position, self.dtype, self.device)
         # Prefill without cache situation.
@@ -453,13 +453,21 @@ class NPUModelRunner:
         # Get the number of scheduled tokens for each request.
         # TODO: The Python loop can be slow. Optimize.
         num_scheduled_tokens = np.empty(num_reqs, dtype=np.int32)
+        block_copy_src = np.empty(num_reqs, dtype=np.int32)
+        block_copy_src.fill(-1)
+        block_copy_dest = np.empty(num_reqs, dtype=np.int32)
+        block_copy_dest.fill(-1)
+        num_copied_tokens = np.zeros(num_reqs, dtype=np.int32)
         max_num_scheduled_tokens = 0
         for i, req_id in enumerate(self.input_batch.req_ids):
             num_tokens = scheduler_output.num_scheduled_tokens[req_id]
             num_scheduled_tokens[i] = num_tokens
             max_num_scheduled_tokens = max(max_num_scheduled_tokens,
                                            num_tokens)
-
+            block_copy_src[i] = scheduler_output.block_copy_src[i]
+            block_copy_dest[i] = scheduler_output.block_copy_dst[i]
+            num_copied_tokens[i] = scheduler_output.mini_block_num_tokens[i]
+        required_miniblock = np.any(num_copied_tokens != 0)
         # Prepare positions
         req_indices = np.repeat(self.arange_np[:num_reqs],
                                 num_scheduled_tokens)
@@ -491,6 +499,9 @@ class NPUModelRunner:
                                positions_np // self.block_size)
         block_table_cpu = self.input_batch.block_table.get_cpu_tensor()
         block_numbers = block_table_cpu.flatten()[block_table_indices].numpy()
+        # if required_miniblock:
+        #     block_offsets = (positions_np + num_copied_tokens) % self.block_size
+        # else:
         block_offsets = positions_np % self.block_size
         np.add(block_numbers * self.block_size,
                block_offsets,
@@ -500,6 +511,8 @@ class NPUModelRunner:
 
         if self.chunked_prefill_enabled:
             attn_state = AscendAttentionState.ChunkedPrefill
+        elif required_miniblock:
+            attn_state = AscendAttentionState.PrefillCacheHitMiniBlock
         elif np.array_equal(self.seq_lens_np[:num_reqs], num_scheduled_tokens):
             attn_state = AscendAttentionState.PrefillNoCache
         # We assume it is the decode stage, where prefill occurs but only one token is not hit in cache.
@@ -522,6 +535,12 @@ class NPUModelRunner:
             attn_mask=attn_mask,
             attn_state=attn_state,
         )
+        if attn_state == AscendAttentionState.PrefillCacheHitMiniBlock:
+            block_copy_src_tensor, block_copy_dest_tensor, block_copy_cumsum_tensor = (
+                self.process_blockcopy(block_copy_src, block_copy_dest))
+            attn_metadata.block_copy_src = block_copy_src_tensor
+            attn_metadata.block_copy_dest = block_copy_dest_tensor
+            attn_metadata.block_copy_cumsum = block_copy_cumsum_tensor
 
         # Prepare input_ids
         token_indices = (positions_np +
@@ -548,6 +567,32 @@ class NPUModelRunner:
             )
 
         return hidden_states[sample_indices]
+
+    def process_blockcopy(self, src: numpy.ndarray, dst: numpy.ndarray):
+        # todo: modify for real one
+        assert src.shape == dst.shape
+        # 先过滤掉src或dst中的负值
+        valid_mask = (src >= 0) & (dst >= 0)
+        src = src[valid_mask]
+        dst = dst[valid_mask]
+        unique_src, src_indices = numpy.unique(src, return_inverse=True)
+        counts = np.bincount(src_indices)
+
+        result_src = unique_src
+        result_cumsum = np.cumsum(counts)  # 使用cumsum替代原来的counts
+
+        result_dst = np.zeros(counts.sum(), dtype=dst.dtype)
+        current_pos = 0
+        for i, s in enumerate(unique_src):
+            mask = (src == s)
+            count = counts[i]
+            result_dst[current_pos:current_pos + count] = dst[mask]
+            current_pos += count
+        block_copy_src = torch.from_numpy(result_src).to(self.device)
+        block_copy_dest = torch.from_numpy(result_dst).to(self.device)
+        block_copy_cumsum = torch.from_numpy(result_cumsum).to(self.device)
+        return block_copy_src, block_copy_dest, block_copy_cumsum
+
 
     @torch.inference_mode()
     def execute_model(

@@ -59,6 +59,12 @@ def engine_core_init_with_ascend_scheduler(
         speculative_config=vllm_config.speculative_config,
         log_stats=self.log_stats,
     )
+    if vllm_config.additional_config:
+        miniblock_size = vllm_config.additional_config.get("miniblock_size", -1)
+        ret_ = self.scheduler.maybe_config_miniblock(miniblock_size)
+        if ret_:
+            logger.info("Enable miniblock for NPU...")
+
 
     # Setup MM Input Mapper.
     self.mm_input_cache_server = MMInputCacheServer(vllm_config.model_config)

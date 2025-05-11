@@ -19,8 +19,10 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Type
 
+import numpy
 import torch
 import torch_npu
+from torch.cuda import device
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionLayer, AttentionType)
 from vllm.attention.backends.utils import CommonAttentionState
@@ -87,8 +89,9 @@ class AscendAttentionBackend(AttentionBackend):
 class AscendAttentionState(Enum):
     PrefillNoCache = 0
     PrefillCacheHit = 1
-    DecodeOnly = 2
-    ChunkedPrefill = 3
+    PrefillCacheHitMiniBlock = 2
+    DecodeOnly = 3
+    ChunkedPrefill = 4
 
 
 @dataclass
@@ -116,6 +119,9 @@ class AscendMetadata:
     attn_state: AscendAttentionState = AscendAttentionState.ChunkedPrefill
 
     attn_mask: Optional[torch.Tensor] = None
+    block_copy_src: Optional[torch.Tensor] = None
+    block_copy_dest: Optional[torch.Tensor] = None
+    block_copy_cumsum: Optional[torch.Tensor] = None
 
 
 class AscendAttentionBackendImpl(AttentionImpl):
@@ -200,6 +206,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
         value = value.view(-1, self.num_kv_heads, self.head_size)
         # TODO: Remove this contiguous in the future.
         value = value.contiguous()
+        if attn_metadata.attn_state == AscendAttentionState.PrefillCacheHitMiniBlock:
+            assert attn_metadata.block_copy_src is not None
+            assert attn_metadata.block_copy_dest is not None
+            assert attn_metadata.block_copy_cumsum is not None
+            torch_npu._npu_block_copy(key=self.key_cache,
+                                      value=self.value_cache,
+                                      src=attn_metadata.block_copy_src,
+                                      dst=attn_metadata.block_copy_dest,
+                                      cumsum=attn_metadata.block_copy_cumsum)
 
         if kv_cache.numel() > 0:
             if self.key_cache is None:

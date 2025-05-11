@@ -48,6 +48,9 @@ class AscendScheduler(Scheduler):
 
         # Record scheduled LoRA requests.
         scheduled_loras: set[int] = set()
+        block_copy_src: list[int] = []
+        block_copy_dest: list[int] = []
+        num_tokens_to_copied: list[int] = []
 
         # Use a temporary deque to collect requests that need to be skipped
         # and put back at the head of the waiting queue later
@@ -75,9 +78,16 @@ class AscendScheduler(Scheduler):
 
             prompt_limit = self._get_prompt_limit(request)
             # Get already-cached tokens.
+            # 这里返回的是带了miniblock匹配的token数
             computed_blocks, num_computed_tokens = self.kv_cache_manager.get_computed_blocks(
                 request)
+            num_tokens_to_copied_ = num_computed_tokens - len(computed_blocks) * self.kv_cache_manager.block_size
             num_new_tokens = request.num_prompt_tokens - num_computed_tokens
+            if num_tokens_to_copied_ > 0 and request.required_copied:
+                num_tokens_to_copied.append(num_tokens_to_copied_)
+                block_copy_src.append(request.src_block)
+                block_copy_dest.append(request.dest_block)
+                request.reset_blockcopy()
             if (0 < self.scheduler_config.long_prefill_token_threshold <
                     num_new_tokens):
                 num_new_tokens = (
@@ -107,10 +117,11 @@ class AscendScheduler(Scheduler):
                 # Scheduling would exceed watermark, skip.
                 skip_cur_request()
                 continue
-
+            num_tokens_required_blocks = num_new_tokens + num_tokens_to_copied_
             assert num_new_tokens > 0
+            # 为请求分配block，需要把copy的部分算进去
             new_blocks = self.kv_cache_manager.allocate_slots(
-                request, num_new_tokens, computed_blocks)
+                request, num_tokens_required_blocks, computed_blocks)
             if new_blocks is None:
                 # The request cannot be scheduled.
                 break
@@ -264,6 +275,9 @@ class AscendScheduler(Scheduler):
             # the previous and the current steps.
             finished_req_ids=self.finished_req_ids,  # type: ignore
             free_encoder_input_ids=self.encoder_cache_manager.get_freed_ids(),
+            block_copy_src=block_copy_src,
+            block_copy_dst=block_copy_dest,
+            mini_block_num_tokens=num_tokens_to_copied
         )
 
         # Advance the number of computed tokens for the request AFTER
