@@ -41,6 +41,7 @@ class AscendConfig:
         self.expert_map_path = additional_config.get("expert_map_path", None)
         self.chunked_prefill_for_mla = additional_config.get(
             "chunked_prefill_for_mla", False)
+        self.miniblock_size = int(additional_config.get("mini_block_size", 128))
 
 
 class TorchairGraphConfig:
