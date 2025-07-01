@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Type
 
+import numpy
+import numpy as np
 import torch
 import torch_npu
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
@@ -106,6 +108,7 @@ class AscendAttentionState(Enum):
     DecodeOnly = 2
     ChunkedPrefill = 3
     SpecDecoding = 4
+    PrefillCacheHitWithExtra = 5
 
 
 @dataclass
@@ -139,6 +142,13 @@ class AscendMetadata:
     num_input_tokens: int = 0  # Number of tokens including padding.
 
     with_prefill_across_dp: bool = False
+    src_block_indice: Optional[torch.Tensor] = None
+    dst_block_indice: Optional[torch.Tensor] = None
+    block_cumsum: Optional[torch.Tensor] = None
+
+    @property
+    def required_copy(self):
+        return self.src_block_indice is not None and self.dst_block_indice is not None and self.block_cumsum is not None
 
 
 class AscendAttentionMetadataBuilder:
@@ -149,6 +159,30 @@ class AscendAttentionMetadataBuilder:
     def reorder_batch(self, input_batch: "InputBatch",
                       scheduler_output: "SchedulerOutput") -> bool:
         return False
+
+    def prepare_block_copy(self):
+        src, dst = self.runner.copy_src_tensor, self.runner.copy_dest_tensor
+        assert src.shape == dst.shape
+        valid_mask = (src != -1)
+        if not numpy.any(valid_mask):
+            return None, None, None
+
+        valid_src = src[valid_mask]
+        valid_dest = dst[valid_mask]
+
+        sorted_indices = numpy.array(valid_src)
+        unique_src, unique_indices = numpy.unique(valid_src, return_inverse=True)
+
+        cumsum_np = np.cumsum(np.bincount(unique_indices), dtype=numpy.int32)
+
+        sorted_dest = valid_dest[sorted_indices]
+
+        src_tensor = torch.from_numpy(unique_src).to(self.runner.device)
+        dest_tensor = torch.from_numpy(sorted_dest).to(self.runner.device)
+        cumsum_tensor = torch.from_numpy(cumsum_np).to(self.runner.device)
+
+        return src_tensor, dest_tensor, cumsum_tensor
+
 
     def build(self,
               num_reqs,
@@ -182,17 +216,22 @@ class AscendAttentionMetadataBuilder:
                 attn_mask = torch_npu.npu_format_cast(mask_nz.contiguous(),
                                                       ACL_FORMAT_FRACTAL_NZ)
 
+        block_src, block_dest, cumsum = self.prepare_block_copy()
+
         attn_metadata = AscendMetadata(
-            num_actual_tokens=num_actual_tokens,
-            block_tables=block_table,
-            query_start_loc=query_start_loc,
-            query_lens=query_lens,
-            seq_lens=seq_lens,
-            max_query_len=max_query_len,
-            slot_mapping=slot_mapping,
-            attn_mask=attn_mask,
-            attn_state=attn_state,
-            with_prefill_across_dp=with_prefill_across_dp)
+                num_actual_tokens=num_actual_tokens,
+                block_tables=block_table,
+                query_start_loc=query_start_loc,
+                query_lens=query_lens,
+                seq_lens=seq_lens,
+                max_query_len=max_query_len,
+                slot_mapping=slot_mapping,
+                attn_mask=attn_mask,
+                attn_state=attn_state,
+                with_prefill_across_dp=with_prefill_across_dp,
+                src_block_indice=block_src,
+                dst_block_indice=block_dest,
+                block_cumsum=cumsum)
         return attn_metadata
 
 
@@ -295,6 +334,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 if self.key_cache is None:
                     self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
                 slots = attn_metadata.slot_mapping
+                if attn_metadata.attn_state == AscendAttentionState.PrefillCacheHitWithExtra:
+                    if attn_metadata.dst_block_indice is not None \
+                            and attn_metadata.src_block_indice is not None \
+                            and attn_metadata.block_cumsum is not None:
+                        torch_npu._npu_block_copy(self.key_cache, self.value_cache,
+                                                  attn_metadata.src_block_indice,
+                                                  attn_metadata.dst_block_indice,
+                                                  attn_metadata.block_cumsum)
                 torch_npu._npu_reshape_and_cache(
                     key=key[:num_actual_tokens],
                     value=value[:num_actual_tokens],

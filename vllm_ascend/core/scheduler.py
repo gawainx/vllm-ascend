@@ -31,6 +31,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
+from vllm_ascend.core.miniblock.kv_cache_manager import KVCacheManagerWithMini
 
 
 class AscendScheduler(Scheduler):
@@ -51,6 +52,36 @@ class AscendScheduler(Scheduler):
                          include_finished_set, log_stats)
         self.scheduled_req_ids: set[str] = set()
         self.running: list[Request] = []
+        self._enable_mini_block = False
+        self.init_miniblock()
+
+    @property
+    def enable_miniblock(self):
+        return self._enable_mini_block
+
+    def init_miniblock(self):
+        mini_block_size = getattr(self.vllm_config.scheduler_config, "mini_block_size", -1)
+        if 0 < mini_block_size < self.block_size:
+            self._enable_mini_block = True
+            self.kv_cache_manager = KVCacheManagerWithMini(
+                    kv_cache_config=self.kv_cache_config,
+                    max_model_len=self.max_model_len,
+                    enable_caching=self.cache_config.enable_prefix_caching,
+                    caching_hash_algo=self.cache_config.prefix_caching_hash_algo,
+                    use_eagle=self.use_eagle,
+                    log_stats=self.log_stats,
+                    enable_kv_cache_events=self.enable_kv_cache_events,
+                    mini_block_size=mini_block_size
+            )
+
+    @staticmethod
+    def set_block_copy(schedueler_output, src, dst, copy_token_nums):
+        if len(src) != 0 and len(dst) != 0 and len(copy_token_nums) != 0:
+            setattr(schedueler_output, "batch_src_block_indices", src)
+            setattr(schedueler_output, "batch_dest_block_indices", dst)
+            setattr(schedueler_output, "batch_copied_token_nums", copy_token_nums)
+        return schedueler_output
+
 
     def schedule(self) -> SchedulerOutput:
         if self.scheduler_config.chunked_prefill_enabled:
@@ -75,6 +106,9 @@ class AscendScheduler(Scheduler):
         # Use a temporary deque to collect requests that need to be skipped
         # and put back at the head of the waiting queue later
         skipped_waiting_requests: deque[Request] = deque()
+        batch_src_blk_indices = []
+        batch_dest_blk_indices = []
+        batch_copied_nums = []
 
         # Schedule prefill requests first.
         while self.waiting and token_budget > 0:
@@ -191,7 +225,10 @@ class AscendScheduler(Scheduler):
             if new_blocks is None:
                 # The request cannot be scheduled.
                 break
-
+            if self.enable_miniblock:
+                batch_src_blk_indices.append(self.kv_cache_manager.req_to_copy_meta[request.request_id].src_blk_id)
+                batch_dest_blk_indices.append(self.kv_cache_manager.req_to_copy_meta[request.request_id].dst_blk_id)
+                batch_copied_nums.append(self.kv_cache_manager.req_to_copy_meta[request.request_id].num_copied_tokens)
             # KVConnector: update internal state after allocation.
             # This information is used to determine if a load is
             # needed for this request.
@@ -399,7 +436,8 @@ class AscendScheduler(Scheduler):
             structured_output_request_ids={},
             grammar_bitmask=None,
         )
-
+        scheduler_output = self.set_block_copy(scheduler_output, batch_src_blk_indices,
+                                               batch_dest_blk_indices, batch_copied_nums)
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
         # 2. Wrap up all the KV cache load / save ops into an opaque object

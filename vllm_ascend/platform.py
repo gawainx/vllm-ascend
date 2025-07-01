@@ -218,6 +218,7 @@ class NPUPlatform(Platform):
                 ascend_scheduler_config = AscendSchedulerConfig.initialize_from_config(
                     vllm_config.scheduler_config,
                     ascend_config.ascend_scheduler_config)
+                setattr(ascend_scheduler_config, "mini_block_size", ascend_config.miniblock_size)
                 vllm_config.scheduler_config = ascend_scheduler_config
 
     @classmethod

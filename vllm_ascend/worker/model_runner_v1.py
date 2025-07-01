@@ -369,6 +369,23 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
+        self.copy_src_tensor: Optional[torch.Tensor] = None
+        self.copy_dest_tensor: Optional[torch.Tensor] = None
+        self.batch_copied_token_tensor: Optional[torch.Tensor] = None
+
+    def _prepare_prefix_cache_extra(self, scheduler_output: "SchedulerOutput"):
+        src_block_indices = getattr(scheduler_output, "batch_src_block_indices", [])
+        dest_block_indices = getattr(scheduler_output, "batch_dest_block_indices", [])
+        copied_token_nums = getattr(scheduler_output, "batch_copied_token_nums", [])
+        if len(src_block_indices) != 0 and len(dest_block_indices) != 0 and len(copied_token_nums) != 0 \
+            and len(src_block_indices) == len(dest_block_indices):
+            self.copy_src_tensor = np.array(src_block_indices)
+            self.copy_dest_tensor = np.array(dest_block_indices)
+            self.batch_copied_token_tensor = np.array(copied_token_nums)
+        else:
+            self.copy_dest_tensor = None
+            self.copy_src_tensor = None
+            self.batch_copied_token_tensor = None
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler
@@ -377,6 +394,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         The SamplingMetadata is updated and copied to the NPU if there is a
         new/resumed/paused/finished request in the batch.
         """
+        self._prepare_prefix_cache_extra(scheduler_output)
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
